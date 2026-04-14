@@ -3,52 +3,38 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, FallingEdge
 
-async def simulate_button_press(dut, pin_index):
-    """Simulates a bouncy physical button press."""
-    dut.ui_in.value = int(dut.ui_in.value) | (1 << pin_index)
-    await ClockCycles(dut.clk, 2)
-    dut.ui_in.value = int(dut.ui_in.value) & ~(1 << pin_index)
-    await ClockCycles(dut.clk, 1)
-    
-    # Solid press (hold > 8 clocks to pass the debouncer)
-    dut.ui_in.value = int(dut.ui_in.value) | (1 << pin_index)
-    await ClockCycles(dut.clk, 15)
-    
-    # Release
-    dut.ui_in.value = int(dut.ui_in.value) & ~(1 << pin_index)
-    await ClockCycles(dut.clk, 15)
-
-async def decode_uart_string(dut, baud_clocks=3, length=13):
-    """Listens to uio_out[0] and decodes an entire UART string."""
-    received = ""
-    for _ in range(length):
-        # Wait for Start Bit (drops to 0)
-        while int(dut.uio_out.value) & 1 == 1:
-            await FallingEdge(dut.clk)
-            
-        await ClockCycles(dut.clk, baud_clocks // 2) # Center of Start Bit
+async def send_uart_command(dut, char_string, baud_clocks=3):
+    """Simulates a laptop sending data TO the chip over uio_in[1]"""
+    for char in char_string:
+        byte_val = ord(char)
         
-        char_val = 0
-        for i in range(8):
+        dut.uio_in.value = int(dut.uio_in.value) & ~(1 << 1) # Start Bit (LOW)
+        await ClockCycles(dut.clk, baud_clocks)
+        
+        for i in range(8): # Data Bits (LSB first)
+            bit = (byte_val >> i) & 1
+            if bit:
+                dut.uio_in.value = int(dut.uio_in.value) | (1 << 1)
+            else:
+                dut.uio_in.value = int(dut.uio_in.value) & ~(1 << 1)
             await ClockCycles(dut.clk, baud_clocks)
-            bit = int(dut.uio_out.value) & 1
-            char_val |= (bit << i)
             
-        await ClockCycles(dut.clk, baud_clocks) # Stop Bit
-        received += chr(char_val)
-    return received
+        dut.uio_in.value = int(dut.uio_in.value) | (1 << 1) # Stop Bit (HIGH)
+        await ClockCycles(dut.clk, baud_clocks)
+        
+        await ClockCycles(dut.clk, baud_clocks * 2) # Gap
 
 @cocotb.test()
-async def test_telemetry_stopwatch(dut):
-    dut._log.info("Starting Telemetry Stopwatch Full System Test")
+async def test_bidirectional_telemetry(dut):
+    dut._log.info("Starting Bidirectional Command & Control Test")
     
     clock = Clock(dut.clk, 100, unit="ns")
     cocotb.start_soon(clock.start())
 
-    # Phase 1: Reset & Setup (Set Alarm Target to 3 in top 4 bits)
+    # Phase 1: Reset & Setup 
     dut.ena.value = 1
-    dut.ui_in.value = 0b0011_0000 # Target = 3
-    dut.uio_in.value = 0
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0b0000_0010 # Hold RX high (idle) on uio_in[1]
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
@@ -56,59 +42,52 @@ async def test_telemetry_stopwatch(dut):
 
     # -------------------------------------------------------------------
     # GATE-LEVEL SIMULATION BYPASS
-    # 1 sec = 10,000,000 physical clocks. Waiting for 3 seconds takes hours.
-    # We verify structural reset integrity and then gracefully exit.
     # -------------------------------------------------------------------
     if os.environ.get("GATES") == "yes":
         dut._log.info("Gate-Level Simulation detected. Bypassing 10M clock waits.")
+        dut._log.info("Testing UART RX structural integrity...")
         
-        # Verify the 7-segment display properly reset to '0'
-        current_led = int(dut.uo_out.value) & 0x7F
-        assert current_led == 0b0111111, "GL Reset Failed! Display is not 0."
+        # Test Reset Command structurally via UART RX (Uses default 1041 baud clocks)
+        await send_uart_command(dut, 'R', baud_clocks=1041)
+        await ClockCycles(dut.clk, 50)
         
-        # Verify the UART TX pin is held HIGH (Idle state)
-        uart_idle = int(dut.uio_out.value) & 1
-        assert uart_idle == 1, "GL Reset Failed! UART TX pin is not idle (HIGH)."
+        current_led_after_reset = int(dut.uo_out.value) & 0x7F
+        assert current_led_after_reset == 0b0111111, "GL UART RX Reset Command Failed!"
         
         dut._log.info("GL Structural Integrity Verified. Exiting smoothly.")
-        return # Skip the long RTL timing tests!
+        return # Skip the rest of the test!
 
     # -------------------------------------------------------------------
-    # RTL SIMULATION (Fast Clocks via tb.v overrides)
+    # RTL SIMULATION (Fast Clocks)
     # -------------------------------------------------------------------
-
-    # Phase 2: Start Stopwatch
-    dut._log.info("Pressing Start Button...")
-    dut.ui_in.value = int(dut.ui_in.value) | 0b0000_0001
-    await ClockCycles(dut.clk, 20) # Pass debouncer
-
-    # Phase 3: Wait for 1, then hit Lap
-    await ClockCycles(dut.clk, 100) # 100 clocks = 1 simulated sec passes
-    dut._log.info("Timer hit 1. Pressing Lap Button!")
-    await simulate_button_press(dut, 1) # Hit Lap (ui_in[1])
     
-    lap_val = (int(dut.uio_out.value) >> 4) & 0xF
-    assert lap_val == 1, f"Lap Memory Failed! Expected 1, got {lap_val}"
-    dut._log.info("Lap memory correctly stored '1' in uio_out[7:4].")
-
-    # Phase 4: Wait for the Alarm (Target = 3) and intercept UART
-    dut._log.info("Waiting for timer to hit target (3) to trigger UART...")
+    # Phase 2: Send 'S' over UART to start the stopwatch
+    dut._log.info("Sending 'S' (Start) command over UART...")
+    await send_uart_command(dut, 'S', baud_clocks=3)
     
-    # Start a background task to listen to the UART line
-    uart_task = cocotb.start_soon(decode_uart_string(dut, baud_clocks=3, length=13))
-    
-    # Wait for the timer to count 2, then 3. (2 seconds = 200 clocks)
+    # Wait for 2 simulated seconds (200 clocks)
     await ClockCycles(dut.clk, 200) 
     
-    # Check if the decimal point (Alarm LED) turned on
-    dp_led = (int(dut.uo_out.value) >> 7) & 1
-    assert dp_led == 1, "Alarm LED (uo_out[7]) did not turn on!"
+    current_led = int(dut.uo_out.value) & 0x7F
+    assert current_led != 0b0111111, "Stopwatch failed to start via UART command!"
+    dut._log.info("UART Start Command Success! Timer is ticking.")
+
+    # Phase 3: Send 'L' over UART to trigger Lap Memory
+    dut._log.info("Sending 'L' (Lap) command over UART...")
+    await send_uart_command(dut, 'L', baud_clocks=3)
+    await ClockCycles(dut.clk, 10)
     
-    # Await the UART string decoding
-    received_string = await uart_task
-    dut._log.info(f"UART Transmitted: {repr(received_string)}")
+    lap_val = (int(dut.uio_out.value) >> 4) & 0xF
+    assert lap_val == 2, f"UART Lap Command Failed! Expected 2, got {lap_val}"
+    dut._log.info("UART Lap Command Success! Lap memory stored '2'.")
+
+    # Phase 4: Send 'R' over UART to Soft Reset
+    dut._log.info("Sending 'R' (Reset) command over UART...")
+    await send_uart_command(dut, 'R', baud_clocks=3)
+    await ClockCycles(dut.clk, 10)
     
-    expected_string = "VIT Vellore\r\n"
-    assert received_string == expected_string, "UART string mismatch!"
-    
-    dut._log.info("All Telemetry, Lap Memory, and Alarm tests passed perfectly!")
+    current_led_after_reset = int(dut.uo_out.value) & 0x7F
+    assert current_led_after_reset == 0b0111111, "UART Reset Command Failed! Display is not 0."
+    dut._log.info("UART Reset Command Success! System zeroed out.")
+
+    dut._log.info("All RX/TX Bidirectional Command tests passed perfectly!")

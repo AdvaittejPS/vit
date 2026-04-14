@@ -26,7 +26,7 @@ module tb ();
     tt_um_advaittej_stopwatch 
 `ifndef GL_TEST
     #(
-        .CLOCKS_PER_SECOND(24'd9), // 10 clocks = 1 second
+      .CLOCKS_PER_SECOND(24'd99), // 10 clocks = 1 second
         .CLOCKS_PER_BAUD(12'd2)    // 3 clocks = 1 baud bit
     )
 `endif

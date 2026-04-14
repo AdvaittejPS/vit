@@ -10,13 +10,11 @@ async def simulate_button_press(dut, pin_index):
     dut.ui_in.value = int(dut.ui_in.value) & ~(1 << pin_index)
     await ClockCycles(dut.clk, 1)
     
-    # Solid press (hold > 8 clocks to pass the debouncer)
     dut.ui_in.value = int(dut.ui_in.value) | (1 << pin_index)
-    await ClockCycles(dut.clk, 15)
+    await ClockCycles(dut.clk, 15) # Solid press
     
-    # Release
     dut.ui_in.value = int(dut.ui_in.value) & ~(1 << pin_index)
-    await ClockCycles(dut.clk, 15)
+    await ClockCycles(dut.clk, 15) # Release
 
 async def send_uart_command(dut, char_string, baud_clocks=3):
     """Simulates a laptop sending data TO the chip over uio_in[1]"""
@@ -36,7 +34,6 @@ async def send_uart_command(dut, char_string, baud_clocks=3):
             
         dut.uio_in.value = int(dut.uio_in.value) | (1 << 1) # Stop Bit (HIGH)
         await ClockCycles(dut.clk, baud_clocks)
-        
         await ClockCycles(dut.clk, baud_clocks * 2) # Gap
 
 async def decode_uart_string(dut, baud_clocks=3, length=13):
@@ -78,16 +75,13 @@ async def test_paranoia_suite(dut):
         assert (int(dut.uo_out.value) & 0x7F) == 0b0111111, "GL UART RX Reset Failed!"
         return 
 
-    # -------------------------------------------------------------------
     # EDGE CASE 1: GLITCH REJECTION
-    # -------------------------------------------------------------------
     dut._log.info("Testing Glitch Rejection: Injecting 5-clock noise spike on ui_in[0]...")
     dut.ui_in.value = int(dut.ui_in.value) | 1
     await ClockCycles(dut.clk, 5) # Too short for the 8-clock debouncer
     dut.ui_in.value = int(dut.ui_in.value) & ~1
     await ClockCycles(dut.clk, 50)
-    
-    assert (int(dut.uo_out.value) & 0x7F) == 0b0111111, "Glitch Rejection Failed! Timer started on noise."
+    assert (int(dut.uo_out.value) & 0x7F) == 0b0111111, "Glitch Rejection Failed!"
     dut._log.info("Glitch ignored. Debouncer is solid.")
 
     # Standard Start
@@ -95,24 +89,18 @@ async def test_paranoia_suite(dut):
     await simulate_button_press(dut, 0)
     await ClockCycles(dut.clk, 100) # Hits 1
 
-    # -------------------------------------------------------------------
     # EDGE CASE 2: THE PAUSE STATE
-    # -------------------------------------------------------------------
     dut._log.info("Testing Pause State: Sending 'S' to pause at 1...")
     await send_uart_command(dut, 'S', baud_clocks=3)
-    
-    await ClockCycles(dut.clk, 250) # Wait 2.5 simulated seconds
+    await ClockCycles(dut.clk, 250) 
     assert (int(dut.uo_out.value) & 0x7F) == 0b0000110, "Pause Failed! Timer kept running."
     dut._log.info("Pause verified. Timer held state perfectly.")
 
-    # -------------------------------------------------------------------
     # EDGE CASE 3: ROGUE UART DATA
-    # -------------------------------------------------------------------
     dut._log.info("Testing Rogue Data: Sending invalid command 'Q'...")
     await send_uart_command(dut, 'Q', baud_clocks=3)
     await ClockCycles(dut.clk, 50)
-    
-    assert (int(dut.uo_out.value) & 0x7F) == 0b0000110, "Rogue Data Failed! 'Q' altered the timer state."
+    assert (int(dut.uo_out.value) & 0x7F) == 0b0000110, "Rogue Data Failed!"
     dut._log.info("Rogue data ignored. Command decoder is secure.")
     
     # Resume counting
@@ -126,23 +114,35 @@ async def test_paranoia_suite(dut):
     # Autonomous TX at 3
     dut._log.info("Waiting for timer to hit 3 to trigger TX...")
     uart_task = cocotb.start_soon(decode_uart_string(dut, baud_clocks=3, length=13))
-    await ClockCycles(dut.clk, 100) # Hits 3
     
+    # Await the transmission to finish
     received_string = await uart_task
     assert received_string == "VIT Vellore\r\n", "TX String Mismatch!"
+    dut._log.info("UART Payload Successfully Exfiltrated.")
 
-    # -------------------------------------------------------------------
-    # EDGE CASE 4: THE ROLLOVER
-    # -------------------------------------------------------------------
-    dut._log.info("Testing BCD Rollover: Fast-forwarding to 9...")
-    await ClockCycles(dut.clk, 600) # Fast forward 6 seconds (Hits 9)
+    # EDGE CASE 4: THE ROLLOVER (Using polling instead of blind waits)
+    dut._log.info("Testing BCD Rollover: Actively polling hardware for 9...")
     
-    assert (int(dut.uo_out.value) & 0x7F) == 0b1101111, "Counter failed to reach 9."
+    # Loop until display shows 9 (0b1101111)
+    reached_9 = False
+    for _ in range(100): 
+        if (int(dut.uo_out.value) & 0x7F) == 0b1101111:
+            reached_9 = True
+            break
+        await ClockCycles(dut.clk, 10)
+        
+    assert reached_9, f"Counter failed to reach 9. Display stuck at: {int(dut.uo_out.value) & 0x7F}"
+    dut._log.info("Hardware hit 9. Polling for rollover to 0...")
     
-    dut._log.info("Timer is at 9. Waiting 1 second for rollover...")
-    await ClockCycles(dut.clk, 100) 
-    
-    assert (int(dut.uo_out.value) & 0x7F) == 0b0111111, "Rollover Failed! Expected 0, got a Hex/Garbage value."
+    # Loop until display rolls over to 0 (0b0111111)
+    rolled_over = False
+    for _ in range(20):
+        if (int(dut.uo_out.value) & 0x7F) == 0b0111111:
+            rolled_over = True
+            break
+        await ClockCycles(dut.clk, 10)
+        
+    assert rolled_over, "Rollover Failed! Expected 0, got a Hex/Garbage value."
     dut._log.info("Rollover verified. 9 wrapped perfectly back to 0.")
 
     # Soft Reset

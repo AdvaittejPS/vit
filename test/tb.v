@@ -26,8 +26,8 @@ module tb ();
     tt_um_advaittej_stopwatch 
 `ifndef GL_TEST
     #(
-      .CLOCKS_PER_SECOND(24'd99), // 10 clocks = 1 second
-        .CLOCKS_PER_BAUD(12'd2)    // 3 clocks = 1 baud bit
+        .CLOCKS_PER_SECOND(24'd99), // 100 clocks = 1 simulated second
+        .CLOCKS_PER_BAUD(12'd2)     // 3 clocks = 1 baud bit
     )
 `endif
     user_project (
@@ -45,7 +45,6 @@ module tb ();
         .rst_n  (rst_n)
     );
 
-    // 10MHz Clock (100ns period)
     initial clk = 0;
     always #50 clk = ~clk;
 

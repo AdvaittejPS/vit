@@ -2,86 +2,89 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, FallingEdge
 
-# REFERENCE MODEL (Golden Vector Generator)
-class StopwatchModel:
-    def __init__(self):
-        self.digit = 0
-        self.running = False
-        # 7-segment hex values for 0-9
-        self.segments = [
-            0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110, 
-            0b1101101, 0b1111101, 0b0000111, 0b1111111, 0b1101111
-        ]
-
-    def reset(self):
-        self.digit = 0
-        self.running = False
-
-    def set_run_state(self, state):
-        self.running = bool(state)
-
-    def tick(self):
-        if self.running:
-            if self.digit == 9:
-                self.digit = 0
-            else:
-                self.digit += 1
-
-    def get_expected_output(self):
-        return self.segments[self.digit]
-
-# TEST SUITE
-@cocotb.test()
-async def test_stopwatch_golden_vectors(dut):
-    dut._log.info("Starting Golden Vector Stopwatch Test")
+async def simulate_button_press(dut, pin_index):
+    """Simulates a bouncy physical button press."""
+    dut.ui_in[pin_index].value = dut.ui_in.value | (1 << pin_index)
+    await ClockCycles(dut.clk, 2)
+    dut.ui_in[pin_index].value = dut.ui_in.value & ~(1 << pin_index)
+    await ClockCycles(dut.clk, 1)
     
-    # Initialize software reference model
-    model = StopwatchModel()
+    # Solid press (hold > 8 clocks to pass the debouncer)
+    dut.ui_in[pin_index].value = dut.ui_in.value | (1 << pin_index)
+    await ClockCycles(dut.clk, 15)
+    
+    # Release
+    dut.ui_in[pin_index].value = dut.ui_in.value & ~(1 << pin_index)
+    await ClockCycles(dut.clk, 15)
 
-    # Set the clock period (Using 10us to match the official TT template)
-    clock = Clock(dut.clk, 10, unit="us")
+async def decode_uart_string(dut, baud_clocks=3, length=13):
+    """Listens to uio_out[0] and decodes an entire UART string."""
+    received = ""
+    for _ in range(length):
+        # Wait for Start Bit
+        while int(dut.uio_out.value) & 1 == 1:
+            await FallingEdge(dut.clk)
+            
+        await ClockCycles(dut.clk, baud_clocks // 2) # Center of Start Bit
+        
+        char_val = 0
+        for i in range(8):
+            await ClockCycles(dut.clk, baud_clocks)
+            bit = int(dut.uio_out.value) & 1
+            char_val |= (bit << i)
+            
+        await ClockCycles(dut.clk, baud_clocks) # Stop Bit
+        received += chr(char_val)
+    return received
+
+@cocotb.test()
+async def test_telemetry_stopwatch(dut):
+    dut._log.info("Starting Telemetry Stopwatch Full System Test")
+    
+    clock = Clock(dut.clk, 100, unit="ns")
     cocotb.start_soon(clock.start())
 
-    # Phase 1: Reset Sequence
-    dut._log.info("Resetting design")
+    # Phase 1: Reset & Setup (Set Alarm Target to 3)
     dut.ena.value = 1
-    dut.ui_in.value = 0
+    dut.ui_in.value = 0b0011_0000 # Target = 3 (ui_in[7:4])
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
-    model.reset()
-    await ClockCycles(dut.clk, 2)
+    await ClockCycles(dut.clk, 10)
+
+    # Phase 2: Start Stopwatch
+    dut._log.info("Pressing Start Button...")
+    dut.ui_in.value = dut.ui_in.value | 0b0000_0001
+    await ClockCycles(dut.clk, 20) # Pass debouncer
+
+    # Phase 3: Wait for 1, then hit Lap
+    await ClockCycles(dut.clk, 10) # 1 sec passes
+    dut._log.info("Timer hit 1. Pressing Lap Button!")
+    await simulate_button_press(dut, 1) # Hit Lap (ui_in[1])
     
-    assert int(dut.uo_out.value) == model.get_expected_output(), "Failed at Reset!"
+    lap_val = (int(dut.uio_out.value) >> 4) & 0xF
+    assert lap_val == 1, f"Lap Memory Failed! Expected 1, got {lap_val}"
+    dut._log.info("Lap memory correctly stored '1' in uio_out[7:4].")
 
-    # Phase 2: Counting Sequence
-    dut._log.info("Pressing Start Button")
-    dut.ui_in.value = 1
-    model.set_run_state(True)
-
-    # Test 15 'seconds' (Our tb.v overrides 1 second to equal 10 clocks)
-    for simulated_second in range(15):
-        await ClockCycles(dut.clk, 10)
-        await FallingEdge(dut.clk)
-        model.tick()
-        
-        expected = model.get_expected_output()
-        actual = int(dut.uo_out.value)
-        
-        dut._log.info(f"Sec {simulated_second + 1}: Expected {bin(expected)}, Got {bin(actual)}")
-        assert actual == expected, f"Mismatch at second {simulated_second + 1}!"
-
-    # Phase 3: Pause Sequence
-    dut._log.info("Pressing Pause Button")
-    dut.ui_in.value = 0
-    model.set_run_state(False)
+    # Phase 4: Wait for the Alarm (Target = 3) and intercept UART
+    dut._log.info("Waiting for timer to hit target (3) to trigger UART...")
     
-    # Wait 5 'seconds' to ensure it doesn't count while paused
-    for _ in range(5):
-        await ClockCycles(dut.clk, 10)
-        await FallingEdge(dut.clk)
-        model.tick()
-        
-    assert int(dut.uo_out.value) == model.get_expected_output(), "Pause failed! HW kept counting."
-    dut._log.info("All Golden Vector tests passed perfectly!")
+    # Start a background task to listen to the UART line
+    uart_task = cocotb.start_soon(decode_uart_string(dut, baud_clocks=3, length=13))
+    
+    # Wait for the timer to count 2, then 3. 
+    await ClockCycles(dut.clk, 20) 
+    
+    # Check if the decimal point (Alarm LED) turned on
+    dp_led = (int(dut.uo_out.value) >> 7) & 1
+    assert dp_led == 1, "Alarm LED (uo_out[7]) did not turn on!"
+    
+    # Await the UART string decoding
+    received_string = await uart_task
+    dut._log.info(f"UART Transmitted: {repr(received_string)}")
+    
+    expected_string = "VIT Vellore\r\n"
+    assert received_string == expected_string, "UART string mismatch!"
+    
+    dut._log.info("All Telemetry, Lap Memory, and Alarm tests passed perfectly!")

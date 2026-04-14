@@ -4,17 +4,18 @@ from cocotb.triggers import ClockCycles, FallingEdge
 
 async def simulate_button_press(dut, pin_index):
     """Simulates a bouncy physical button press."""
-    dut.ui_in[pin_index].value = dut.ui_in.value | (1 << pin_index)
+    # Add int() to cast the LogicArray to a standard integer
+    dut.ui_in.value = int(dut.ui_in.value) | (1 << pin_index)
     await ClockCycles(dut.clk, 2)
-    dut.ui_in[pin_index].value = dut.ui_in.value & ~(1 << pin_index)
+    dut.ui_in.value = int(dut.ui_in.value) & ~(1 << pin_index)
     await ClockCycles(dut.clk, 1)
     
     # Solid press (hold > 8 clocks to pass the debouncer)
-    dut.ui_in[pin_index].value = dut.ui_in.value | (1 << pin_index)
+    dut.ui_in.value = int(dut.ui_in.value) | (1 << pin_index)
     await ClockCycles(dut.clk, 15)
     
     # Release
-    dut.ui_in[pin_index].value = dut.ui_in.value & ~(1 << pin_index)
+    dut.ui_in.value = int(dut.ui_in.value) & ~(1 << pin_index)
     await ClockCycles(dut.clk, 15)
 
 async def decode_uart_string(dut, baud_clocks=3, length=13):
@@ -55,7 +56,8 @@ async def test_telemetry_stopwatch(dut):
 
     # Phase 2: Start Stopwatch
     dut._log.info("Pressing Start Button...")
-    dut.ui_in.value = dut.ui_in.value | 0b0000_0001
+    # Wrap in int() here as well!
+    dut.ui_in.value = int(dut.ui_in.value) | 0b0000_0001
     await ClockCycles(dut.clk, 20) # Pass debouncer
 
     # Phase 3: Wait for 1, then hit Lap
